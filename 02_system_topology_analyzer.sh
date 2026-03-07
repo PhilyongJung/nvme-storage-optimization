@@ -93,10 +93,137 @@ system_overview() {
     print_header "SYSTEM OVERVIEW"
 
     print_info "Hostname" "$(hostname)"
-    print_info "Kernel" "$(uname -r)"
-    print_info "OS" "$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo 'Unknown')"
     print_info "Architecture" "$(uname -m)"
     print_info "Date" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    # ── Detailed OS Info ──
+    echo ""
+    print_subheader "OS Information"
+    local os_name os_id os_version os_codename
+    os_name=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo 'Unknown')
+    os_id=$(grep "^ID=" /etc/os-release 2>/dev/null | cut -d'=' -f2 || echo 'Unknown')
+    os_version=$(grep "^VERSION_ID=" /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo 'Unknown')
+    os_codename=$(grep "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d'=' -f2 || echo 'Unknown')
+    print_info "Distribution" "$os_name"
+    print_info "OS ID / Version" "${os_id} / ${os_version}"
+    print_info "Codename" "$os_codename"
+    if [[ "$os_id" == "ubuntu" ]]; then
+        local minor_ver
+        minor_ver=$(echo "$os_version" | cut -d'.' -f2)
+        if [[ "$minor_ver" == "04" ]]; then
+            print_info "LTS Status" "Ubuntu ${os_version} LTS (Long Term Support)"
+        else
+            print_info "LTS Status" "Ubuntu ${os_version} (Interim Release)"
+        fi
+        if uname -r | grep -q "\-hwe"; then
+            print_info "Kernel Type" "HWE (Hardware Enablement) kernel"
+        else
+            print_info "Kernel Type" "GA (General Availability) kernel"
+        fi
+    fi
+
+    # ── Detailed Kernel Info ──
+    echo ""
+    print_subheader "Kernel Information"
+    print_info "Kernel Version" "$(uname -r)"
+    print_info "Kernel Build" "$(uname -v)"
+    print_info "Kernel Arch" "$(uname -m)"
+
+    local kconfig=""
+    if [[ -f "/boot/config-$(uname -r)" ]]; then
+        kconfig="/boot/config-$(uname -r)"
+    elif [[ -f /proc/config.gz ]]; then
+        kconfig="/proc/config.gz"
+    fi
+    if [[ -n "$kconfig" ]]; then
+        print_info "Kernel Config" "$kconfig"
+        echo ""
+        echo "  Key I/O Kernel Configs:"
+        local io_configs=(
+            "CONFIG_BLK_DEV_NVME"
+            "CONFIG_NVME_MULTIPATH"
+            "CONFIG_IO_URING"
+            "CONFIG_NVME_TARGET"
+            "CONFIG_BLK_MQ_PCI"
+            "CONFIG_BLK_WBT"
+            "CONFIG_VFIO_PCI"
+            "CONFIG_BLK_CGROUP"
+        )
+        for cfg in "${io_configs[@]}"; do
+            local val
+            if [[ "$kconfig" == *.gz ]]; then
+                val=$(zgrep "^${cfg}=" "$kconfig" 2>/dev/null | cut -d'=' -f2 || echo "not set")
+            else
+                val=$(grep "^${cfg}=" "$kconfig" 2>/dev/null | cut -d'=' -f2 || echo "not set")
+            fi
+            printf "    %-35s = %s\n" "$cfg" "$val"
+        done
+    fi
+
+    # ── Loaded I/O Modules ──
+    echo ""
+    echo "  Loaded I/O Modules:"
+    local io_modules=("nvme" "nvme_core" "nvme_fabrics" "nvme_tcp" "nvme_rdma" "vfio_pci" "uio" "uio_pci_generic" "nbd")
+    for mod in "${io_modules[@]}"; do
+        if lsmod 2>/dev/null | grep -qw "$mod"; then
+            echo -e "    ${mod}: ${GREEN}loaded${NC}"
+        else
+            echo "    ${mod}: not loaded"
+        fi
+    done
+
+    # ── I/O Stack Info ──
+    echo ""
+    print_subheader "I/O Stack Information"
+
+    # io_uring support
+    if [[ -f /proc/config.gz ]] && zgrep -q "CONFIG_IO_URING=y" /proc/config.gz 2>/dev/null; then
+        print_ok "io_uring: Compiled in kernel"
+    elif [[ -n "$kconfig" && "$kconfig" != *.gz ]] && grep -q "CONFIG_IO_URING=y" "$kconfig" 2>/dev/null; then
+        print_ok "io_uring: Compiled in kernel"
+    else
+        print_info "io_uring" "Not detected or check /boot/config-$(uname -r)"
+    fi
+
+    # SPDK check
+    if command -v spdk_nvme_perf &>/dev/null || [[ -d /opt/spdk ]] || [[ -d /usr/local/lib/spdk ]]; then
+        print_ok "SPDK: Installed ($(spdk_nvme_perf --version 2>/dev/null || echo 'path found'))"
+    else
+        print_info "SPDK" "Not installed"
+    fi
+
+    # fio check
+    if command -v fio &>/dev/null; then
+        local fio_ver fio_engines
+        fio_ver=$(fio --version 2>/dev/null || echo "unknown")
+        fio_engines=$(fio --enghelp 2>/dev/null | grep -cE "io_uring|libaio|psync|spdk" || echo "?")
+        print_ok "fio: ${fio_ver} (${fio_engines} relevant engines)"
+        echo "    Engines:"
+        fio --enghelp 2>/dev/null | grep -E "io_uring|libaio|psync|pvsync|spdk|sg" | while read -r eng; do
+            echo "      $eng"
+        done
+    else
+        print_info "fio" "Not installed"
+    fi
+
+    # bpftrace / perf check
+    if command -v bpftrace &>/dev/null; then
+        print_ok "bpftrace: $(bpftrace --version 2>/dev/null | head -1)"
+    else
+        print_info "bpftrace" "Not installed"
+    fi
+    if command -v perf &>/dev/null; then
+        print_ok "perf: $(perf version 2>/dev/null | head -1)"
+    else
+        print_info "perf" "Not installed"
+    fi
+
+    # nvme-cli version
+    if command -v nvme &>/dev/null; then
+        print_ok "nvme-cli: $(nvme version 2>/dev/null || echo 'installed')"
+    else
+        print_info "nvme-cli" "Not installed"
+    fi
 
     # CPU info
     local cpu_model
@@ -151,6 +278,139 @@ system_overview() {
         fi
     else
         print_info "CPU Freq Scaling" "Not available (possibly running in VM or cpufreq disabled)"
+    fi
+}
+
+# ─── Memory Configuration ────────────────────────────────────────────────────
+memory_configuration() {
+    print_header "MEMORY (DIMM) CONFIGURATION"
+
+    # Total memory
+    local total_mem
+    total_mem=$(free -h 2>/dev/null | grep Mem | awk '{print $2}')
+    print_info "Total System Memory" "${total_mem:-Unknown}"
+
+    # dmidecode for DIMM details (requires root)
+    if [[ $EUID -eq 0 ]] && check_command dmidecode; then
+
+        # Physical Memory Array info
+        echo ""
+        print_subheader "Physical Memory Arrays"
+        dmidecode -t 16 2>/dev/null | grep -E "Maximum Capacity|Number Of Devices|Error Correction" | while read -r line; do
+            echo "  $line"
+        done
+
+        # DIMM Slot Summary
+        echo ""
+        print_subheader "DIMM Slot Summary"
+        local total_slots=0
+        local populated_slots=0
+        local total_capacity_mb=0
+
+        echo ""
+        printf "  %-8s %-14s %-8s %-10s %-16s %-20s %-22s\n" \
+            "Slot" "Locator" "Size" "Speed" "Type" "Vendor" "Part Number"
+        echo "  ─────────────────────────────────────────────────────────────────────────────────────────────────"
+
+        # Parse each Memory Device (type 17)
+        local slot_idx=0
+        dmidecode -t 17 2>/dev/null | awk '
+        /^Memory Device$/ { slot++ }
+        /Size:/ { size[slot] = $0; sub(/.*Size: */, "", size[slot]) }
+        /Speed:.*MHz/ && !/Configured/ { speed[slot] = $0; sub(/.*Speed: */, "", speed[slot]) }
+        /Configured Memory Speed:/ { cfg_speed[slot] = $0; sub(/.*Configured Memory Speed: */, "", cfg_speed[slot]) }
+        /Type:/ && !/Detail/ && !/Error/ { type[slot] = $0; sub(/.*Type: */, "", type[slot]) }
+        /Manufacturer:/ { vendor[slot] = $0; sub(/.*Manufacturer: */, "", vendor[slot]) }
+        /Part Number:/ { part[slot] = $0; sub(/.*Part Number: */, "", part[slot]) }
+        /Locator:/ && !/Bank/ { locator[slot] = $0; sub(/.*Locator: */, "", locator[slot]) }
+        /Bank Locator:/ { bank[slot] = $0; sub(/.*Bank Locator: */, "", bank[slot]) }
+        /Serial Number:/ { serial[slot] = $0; sub(/.*Serial Number: */, "", serial[slot]) }
+        /Rank:/ { rank[slot] = $0; sub(/.*Rank: */, "", rank[slot]) }
+        END {
+            for (i=1; i<=slot; i++) {
+                sz = (size[i] ~ /No Module/) ? "Empty" : size[i]
+                sp = (speed[i] != "") ? speed[i] : "N/A"
+                tp = (type[i] != "") ? type[i] : "N/A"
+                vn = (vendor[i] != "") ? vendor[i] : "N/A"
+                pn = (part[i] != "") ? part[i] : "N/A"
+                lo = (locator[i] != "") ? locator[i] : "N/A"
+                printf "  %-8d %-14s %-8s %-10s %-16s %-20s %-22s\n", i, lo, sz, sp, tp, vn, pn
+            }
+        }'
+
+        # Summary counts
+        echo ""
+        local total_s populated_s
+        total_s=$(dmidecode -t 17 2>/dev/null | grep -c "^Memory Device$" || echo "0")
+        populated_s=$(dmidecode -t 17 2>/dev/null | grep "Size:" | grep -cv "No Module Installed" || echo "0")
+        local empty_s=$((total_s - populated_s))
+
+        print_info "Total DIMM Slots" "$total_s"
+        print_info "Populated Slots" "$populated_s"
+        print_info "Empty Slots" "$empty_s"
+
+        # Channels estimation
+        echo ""
+        print_subheader "Memory Channel Estimation"
+        # Get DIMMs per channel from locator patterns
+        if dmidecode -t 17 2>/dev/null | grep "Locator:" | grep -v "Bank" | head -1 | grep -qiE "CPU|NODE|SOCKET"; then
+            echo "  (Estimating from DIMM locator labels)"
+            dmidecode -t 17 2>/dev/null | grep "Locator:" | grep -v "Bank" | grep -v "^$" | sort | while read -r line; do
+                local loc
+                loc=$(echo "$line" | sed 's/.*Locator: *//')
+                echo "    $loc"
+            done | head -32
+        fi
+
+        # Per-socket memory summary
+        echo ""
+        echo "  Per-Socket Memory Summary:"
+        local prev_bank=""
+        local socket_count=0
+        dmidecode -t 17 2>/dev/null | awk '
+        /Bank Locator:/ {
+            bank=$0; sub(/.*Bank Locator: */, "", bank)
+            if (bank != prev_bank) {
+                if (prev_bank != "") printf "    %-20s : %d DIMMs, %d MB\n", prev_bank, cnt, total_mb
+                prev_bank = bank; cnt = 0; total_mb = 0
+            }
+        }
+        /Size:/ && !/No Module/ {
+            cnt++
+            sz = $0; sub(/.*Size: */, "", sz)
+            if (sz ~ /GB/) { gsub(/ GB/, "", sz); total_mb += sz * 1024 }
+            else if (sz ~ /MB/) { gsub(/ MB/, "", sz); total_mb += sz }
+        }
+        END {
+            if (prev_bank != "") printf "    %-20s : %d DIMMs, %d MB\n", prev_bank, cnt, total_mb
+        }'
+
+        # Configured speed
+        echo ""
+        print_subheader "Memory Speed Details"
+        local max_speed cfg_speed_val
+        max_speed=$(dmidecode -t 17 2>/dev/null | grep "Speed:" | grep -v "Configured" | grep "MHz" | head -1 | sed 's/.*Speed: *//')
+        cfg_speed_val=$(dmidecode -t 17 2>/dev/null | grep "Configured Memory Speed:" | grep "MHz" | head -1 | sed 's/.*Configured Memory Speed: *//')
+        print_info "Max DIMM Speed" "${max_speed:-N/A}"
+        print_info "Configured Speed" "${cfg_speed_val:-N/A}"
+        if [[ -n "$max_speed" && -n "$cfg_speed_val" && "$max_speed" != "$cfg_speed_val" ]]; then
+            print_warn "DIMM running below rated speed: ${cfg_speed_val} < ${max_speed}"
+        fi
+
+    else
+        echo ""
+        if [[ $EUID -ne 0 ]]; then
+            print_warn "Root required for DIMM details. Re-run with sudo."
+        else
+            print_warn "dmidecode not found. Install: apt install dmidecode"
+        fi
+
+        # Fallback: /proc/meminfo basic info
+        echo ""
+        print_subheader "Memory Info (from /proc/meminfo)"
+        grep -E "MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree" /proc/meminfo 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
     fi
 }
 
@@ -262,6 +522,39 @@ pcie_topology() {
     print_subheader "PCIe Device Tree"
     lspci -tv 2>/dev/null || lspci -t 2>/dev/null || echo "  Failed to get PCIe tree"
 
+    # ── System-wide PCIe MPS/MRRS ──
+    echo ""
+    print_subheader "PCIe Max Payload Size (MPS) & Max Read Request Size (MRRS)"
+    echo ""
+    echo -e "  ${BOLD}Note: MPS/MRRS mismatch across devices can cause PCIe errors or limit throughput.${NC}"
+    echo -e "  ${BOLD}All devices on the same hierarchy should have compatible MPS settings.${NC}"
+    echo ""
+    printf "  %-14s %-45s %-12s %-12s\n" "BDF" "Device" "MPS" "MRRS"
+    echo "  ────────────────────────────────────────────────────────────────────────────────────"
+    lspci -nn 2>/dev/null | grep -iE "Non-Volatile|NVM Express|Ethernet|Network|VGA|3D|NVIDIA|AMD/ATI" | while read -r line; do
+        local bdf desc devctl mps mrrs
+        bdf=$(echo "$line" | awk '{print $1}')
+        desc=$(echo "$line" | cut -d' ' -f2- | cut -c1-43)
+        devctl=$(lspci -vvv -s "$bdf" 2>/dev/null | grep "DevCtl:" | head -1)
+        mps=$(echo "$devctl" | grep -oP 'MaxPayload \K[0-9]+ bytes' || echo "N/A")
+        mrrs=$(echo "$devctl" | grep -oP 'MaxReadReq \K[0-9]+ bytes' || echo "N/A")
+        printf "  %-14s %-45s %-12s %-12s\n" "$bdf" "$desc" "$mps" "$mrrs"
+    done
+
+    # MPS/MRRS capability (max supported)
+    echo ""
+    echo "  Capability (Max Supported):"
+    printf "  %-14s %-45s %-12s %-12s\n" "BDF" "Device" "MPS Cap" "MRRS Cap"
+    echo "  ────────────────────────────────────────────────────────────────────────────────────"
+    lspci -nn 2>/dev/null | grep -iE "Non-Volatile|NVM Express|Ethernet|Network|VGA|3D|NVIDIA|AMD/ATI" | while read -r line; do
+        local bdf desc devcap mps_cap
+        bdf=$(echo "$line" | awk '{print $1}')
+        desc=$(echo "$line" | cut -d' ' -f2- | cut -c1-43)
+        devcap=$(lspci -vvv -s "$bdf" 2>/dev/null | grep "DevCap:" | head -1)
+        mps_cap=$(echo "$devcap" | grep -oP 'MaxPayload \K[0-9]+ bytes' || echo "N/A")
+        printf "  %-14s %-45s %-12s\n" "$bdf" "$desc" "$mps_cap"
+    done
+
     # NVMe devices on PCIe
     echo ""
     print_subheader "NVMe Controllers on PCIe"
@@ -279,12 +572,19 @@ pcie_topology() {
         driver=$(lspci -k -s "$bdf" 2>/dev/null | grep "Kernel driver" | awk '{print $NF}' || echo "N/A")
         local blk_dev
         blk_dev=$(ls "/sys/bus/pci/devices/0000:${bdf}/nvme/" 2>/dev/null | head -1 || echo "N/A")
+        # MPS/MRRS per device
+        local devctl mps mrrs
+        devctl=$(lspci -vvv -s "$bdf" 2>/dev/null | grep "DevCtl:" | head -1)
+        mps=$(echo "$devctl" | grep -oP 'MaxPayload \K[0-9]+ bytes' || echo "N/A")
+        mrrs=$(echo "$devctl" | grep -oP 'MaxReadReq \K[0-9]+ bytes' || echo "N/A")
 
         echo -e "  ${BOLD}PCIe BDF: ${bdf}${NC}"
         echo "    Description: $(echo "$line" | cut -d' ' -f2-)"
         echo "    NUMA Node:   $numa_node"
         echo "    Link Speed:  $link_speed (Current)"
         echo "    Link Cap:    $link_cap (Capable)"
+        echo "    MPS:         $mps"
+        echo "    MRRS:        $mrrs"
         echo "    Driver:      $driver"
         echo "    Block Dev:   $blk_dev"
         echo ""
@@ -386,6 +686,70 @@ nvme_details() {
         local pci_addr
         pci_addr=$(readlink -f "${ctrl_path}/device" 2>/dev/null | xargs basename 2>/dev/null || echo "N/A")
         print_info "PCIe BDF" "$pci_addr"
+
+        # ── Vendor/Part-ID from nvme id-ctrl ──
+        local ns_dev="/dev/${nvme_ctrl}n1"
+        if check_command nvme && [[ -b "$ns_dev" || -c "/dev/${nvme_ctrl}" ]]; then
+            local id_ctrl_out
+            id_ctrl_out=$(nvme id-ctrl "/dev/${nvme_ctrl}" 2>/dev/null || echo "")
+            if [[ -n "$id_ctrl_out" ]]; then
+                local vid svid ssvid mn sn fr
+                vid=$(echo "$id_ctrl_out" | grep "^vid " | awk -F: '{print $2}' | xargs)
+                svid=$(echo "$id_ctrl_out" | grep "^ssvid " | awk -F: '{print $2}' | xargs)
+                mn=$(echo "$id_ctrl_out" | grep "^mn " | awk -F: '{print $2}' | xargs)
+                sn=$(echo "$id_ctrl_out" | grep "^sn " | awk -F: '{print $2}' | xargs)
+                fr=$(echo "$id_ctrl_out" | grep "^fr " | awk -F: '{print $2}' | xargs)
+                local subnqn
+                subnqn=$(echo "$id_ctrl_out" | grep "^subnqn " | awk -F: '{print $2}' | xargs)
+                local tnvmcap
+                tnvmcap=$(echo "$id_ctrl_out" | grep "^tnvmcap " | awk -F: '{print $2}' | xargs)
+                local nn
+                nn=$(echo "$id_ctrl_out" | grep "^nn " | awk -F: '{print $2}' | xargs)
+
+                # Decode VID to vendor name
+                local vendor_name="Unknown"
+                case "$vid" in
+                    0x*144d|*144d) vendor_name="Samsung" ;;
+                    0x*1c5c|*1c5c) vendor_name="SK hynix" ;;
+                    0x*1e0f|*1e0f) vendor_name="Kioxia" ;;
+                    0x*8086|*8086) vendor_name="Intel/Solidigm" ;;
+                    0x*1344|*1344) vendor_name="Micron" ;;
+                    0x*15b7|*15b7) vendor_name="Western Digital/SanDisk" ;;
+                    0x*1179|*1179) vendor_name="Toshiba" ;;
+                    0x*1987|*1987) vendor_name="Phison" ;;
+                    0x*126f|*126f) vendor_name="Silicon Motion" ;;
+                    0x*1e49|*1e49) vendor_name="Yangtze Memory (YMTC)" ;;
+                    0x*025e|*025e) vendor_name="Solidigm" ;;
+                esac
+
+                print_info "Vendor ID (VID)" "$vid ($vendor_name)"
+                print_info "Sub-Vendor (SSVID)" "$svid"
+                print_info "Model Number (MN)" "$mn"
+                print_info "Serial Number (SN)" "$sn"
+                print_info "Firmware Rev (FR)" "$fr"
+                if [[ -n "$tnvmcap" && "$tnvmcap" != "0" ]]; then
+                    local cap_tb
+                    cap_tb=$(echo "scale=2; $tnvmcap / 1000000000000" | bc 2>/dev/null || echo "N/A")
+                    print_info "Total NVM Capacity" "${tnvmcap} bytes (~${cap_tb} TB)"
+                fi
+                print_info "Num Namespaces (NN)" "$nn"
+                if [[ -n "$subnqn" ]]; then
+                    print_info "SubNQN" "$subnqn"
+                fi
+
+                # NVMe Features: CMB, PMR, etc.
+                local oacs cmbsz pmrcap
+                oacs=$(echo "$id_ctrl_out" | grep "^oacs " | awk -F: '{print $2}' | xargs)
+                cmbsz=$(echo "$id_ctrl_out" | grep "^cmbsz " | awk -F: '{print $2}' | xargs)
+                pmrcap=$(echo "$id_ctrl_out" | grep "^pmrcap " | awk -F: '{print $2}' | xargs)
+                if [[ -n "$cmbsz" && "$cmbsz" != "0" ]]; then
+                    print_info "CMB (Controller Mem Buf)" "Supported (cmbsz=$cmbsz)"
+                fi
+                if [[ -n "$pmrcap" && "$pmrcap" != "0" ]]; then
+                    print_info "PMR (Persistent Mem Region)" "Supported (pmrcap=$pmrcap)"
+                fi
+            fi
+        fi
 
         # Block devices under this controller
         echo ""
@@ -897,6 +1261,7 @@ main() {
     check_root
 
     system_overview
+    memory_configuration
     numa_topology
     pcie_topology
     nvme_details
